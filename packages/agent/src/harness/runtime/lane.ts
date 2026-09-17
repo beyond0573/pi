@@ -63,7 +63,6 @@ import type {
 	JsonValue,
 	NavigationReadyToCommitOperation,
 	NewEntry,
-	Operation,
 	OperationMeta,
 	OperationResultRecord,
 	OperationState,
@@ -92,6 +91,7 @@ import {
 import { formatSkillInvocation } from "../skills.ts";
 import { durableBranchPreparation, durableCompactionPreparation } from "./drive/structural.ts";
 import { driveOperation } from "./drive.ts";
+import { currentOperationInfo } from "./operation-info.ts";
 import { readAssistantFrames } from "./progress.ts";
 import { chainEntries, committedEntryEvents, readLaneQueues } from "./transcript.ts";
 import {
@@ -194,27 +194,6 @@ function pendingEntryWrite(entryId: string, pending: PendingEntry): NewEntry {
 				customType: pending.customType,
 				...(pending.payload === undefined ? {} : { data: pending.payload }),
 			};
-}
-
-function capturedModel(operation: Operation): ModelIdentity | undefined {
-	const { state } = operation;
-	switch (state.at) {
-		case "assistant.ready":
-		case "assistant.effect_pending":
-		case "assistant.retry_wait":
-			return state.generationContext.configuration.model;
-		case "tools":
-			return state.batch.configuration.model;
-		case "deferred.suspended":
-		case "deferred.effect_pending":
-			return state.configuration.model;
-		case "summary.ready":
-		case "summary.effect_pending":
-		case "summary.retry_wait":
-			return state.summaryContext.configuration.model;
-		default:
-			return undefined;
-	}
 }
 
 /** Runtime implementation of one configured lane. */
@@ -1105,26 +1084,11 @@ export class Lane<TContext extends object | undefined> implements AgentLane {
 
 	inspectExecution(context: Context): Promise<LaneExecutionInfo> {
 		return this.readLane((state) => {
-			const operation = state.operation;
-			const captured = operation === null ? undefined : capturedModel(operation);
-			const current =
-				operation === null
-					? null
-					: {
-							id: operation.meta.operationId,
-							kind: operation.meta.intent.kind,
-							status:
-								operation.state.control.status === "cancel_requested"
-									? ("aborting" as const)
-									: ("open" as const),
-							startedAt: operation.meta.startedAt,
-							...(captured === undefined ? {} : { capturedModel: captured }),
-						};
 			return {
 				lane: this.name,
 				tipId: state.tipId,
 				configuredModel: state.configuration.model,
-				current,
+				current: currentOperationInfo(state.operation),
 				lastOperationId: state.lastOperationId,
 			};
 		}, context);

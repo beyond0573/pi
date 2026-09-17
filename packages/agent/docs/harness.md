@@ -140,11 +140,10 @@ Internal pi objects are trusted typed values: Session, storage, operation proced
 
 ## 0.9 Implementation status
 
-WP00–WP07 are complete (Part 8): the operation graph, public lane runtime, and SQLite host-ownership alignment are implemented. Part 9 states the required conformance matrix; it is not a claim that every listed row already has one dedicated test. Known missing behavior and current contract debt, each labeled again at its section:
+WP00–WP07 are complete (Part 8): the operation graph, public lane runtime, and SQLite host-ownership alignment are implemented. R12 adds process-local Session-wide observation (§5.4), with no remaining `watchSession` stub. Part 9 states the required conformance matrix; it is not a claim that every listed row already has one dedicated test. Known missing behavior and current contract debt, each labeled again at its section:
 
 - **J1 — JSONL snapshot compaction (§1.7):** specified, not implemented; dead bytes are never reclaimed today.
 - **C1 — raw RemoteSession (§2.8):** the specified remote mutation transport contradicts the shipped process-local product; a decision is required before implementing either direction.
-- **R12 — `watchSession` (§5.2):** public method throws `SliceNotImplemented`; the sole stubbed Harness method.
 - **T1 — telemetry (§5.8):** span vocabulary declared; production starts only the tool-hook span. RPC ingress has request-ID cancellation but no trace propagation.
 - **S3 — search (§2.8):** design only; the current `src/search/index.ts` skeleton conflicts with it and has no implementation.
 - **R11 — schema migrations (Part 7):** mechanism specified; activation-gated; no migration exists or is required.
@@ -1008,7 +1007,7 @@ Close writes no cancellation or terminal state. It seals harness and Lane mutati
 
 ## 4.8 Faults
 
-A failed admitted storage commit faults the whole harness: it closes Drive gates, rejects barriers and pending/future calls with `HarnessFault`, and requires process restart — never an expected `Err` result. `faulted:true` appears in snapshots obtained before observation closes; reopen restores from the last successful transactions.
+A failed admitted storage commit faults the whole harness: it closes Drive gates, rejects barriers and pending/future calls with `HarnessFault`, and requires process restart — never an expected `Err` result. `fault` notifies existing observers; a Lane consumer can apply it through `reduceLaneSnapshot` to mark its local snapshot. Successful Session captures always have `faulted:false`, and a previous `handle.snapshot` is not mutated on fault (§5.4). Reopen restores from the last successful transactions.
 
 Close rejects active drive and convenience-operation promises with `HarnessClosed`; already-resolved admissions remain durable, calls not yet accepted return `Err(Closed)`, and surfaces without a `Result` channel reject with `HarnessClosed` on and after close. Provider, tool, and isolated hook failures remain per-lane and in-band. A throw/rejection from trusted deterministic application computation (`systemPrompt`, `toolContext`, `toProviderMessages`, an `entryProjector`) faults the harness; `AgentTool.prepareArguments` is the deliberate exception, normalized to a synthetic tool error.
 
@@ -1077,7 +1076,7 @@ Full declarations: `agent-harness.ts`. `AgentHarness<TContext>` methods (all wit
 
 `AgentHarness.create(options, context)` returns `{ harness, open: OpenOperation[] }`, where `OpenOperation = { lane, operationId, kind, startedAt, aborting?: true }` and `LaneInfo = { name, tipId, operation: CurrentOperationInfo | null }`.
 
-**R12:** `watchSession` currently throws `SliceNotImplemented("watchSession")` — the sole stubbed Harness method. The current `SessionSnapshot` is `{ lanes: LaneInfo[]; faulted: boolean }`; R12 decides whether it stays that small.
+**R12 is implemented:** `watchSession` captures `{ lanes: LaneInfo[]; faulted: boolean }` and subscribes to all subsequent Harness events at one Session mutation boundary. It is an in-process notification interface; §5.4 defines refresh, lifecycle, and resource behavior.
 
 Passing an open `Session` to `create` transfers orchestration ownership to the attachment attempt and then the returned Harness until `close` resolves; if create rejects, ownership returns to the caller. During ownership, raw Branch mutation for a configured AgentLane and direct writes to reserved `pi.*` control addresses can stale the authoritative Lane projection and are trusted-programming defects; session-global application values remain available. `create` creates nothing and restores the small durable projection for every complete lane before returning (§4.4); `open` contains exactly one item per lane with a durable current operation, omits idle lanes, copies `aborting:true` only from durable cancellation control, and is inventory that may become stale — not a reservation, identity prediction, or drive claim. Detailed snapshot payloads are read only by `watch(context)`.
 
@@ -1141,6 +1140,65 @@ interface WatchHandle<T> {
 
 Operation-terminal events are `run_end`, `navigation_end`, and `compaction_end` only when the open snapshot operation kind is standalone compaction; in-run `compaction_start`/`compaction_end` are segment brackets inside the open run. `run_suspend` is non-terminal and leaves the operation open with a deferred descriptor; `run_resume` clears it.
 
+### Session-wide observation
+
+`watchSession(context)` provides a lightweight authoritative capture plus notifications. Its snapshot contains only `{ lanes: LaneInfo[]; faulted: boolean }`: all managed AgentLanes sorted by JavaScript string comparison (`<` / `>`), excluding bare Branches and without creating an implicit `main`. Capture synchronously reads the owned Lane projections and registers the buffered watcher within one Session mutation, with no asynchronous gap. It reads no transcript, inbox payloads, assistant frames, or tool output. Each capture allocates independent arrays, LaneInfo objects, operation summaries, and captured model identities; caller changes cannot affect the runtime or another watcher.
+
+The operation summary uses the same projection as `inspectExecution()`: durable cancellation maps to `aborting`, any other unfinished operation to `open`, and a terminal operation to `null`. `open` does not mean an active provider request or even an installed Drive. `capturedModel` comes only from the current operation state when that state has captured one; configured model identity is not a substitute.
+
+Read `handle.snapshot`, then call `start(listener)` promptly. The watcher buffers all subsequently published `HarnessEvent` types from every Lane and the Harness, including streaming/tool output and global configuration/metadata events; it does not filter to fields present in the snapshot. Events retain their emitting Context. An event naming a Lane absent from the consumer's old snapshot is delivered normally; refresh to discover current inventory.
+
+**The snapshot does not update with events.** Only a successful `resnapshot(context)` replaces `handle.snapshot` and returns the new capture. There is no Session reducer: existing events do not describe every snapshot field transition, including all changes to `capturedModel`. Refresh on relevant notifications or on demand for an authoritative current overview; do not promise continuous field-by-field freshness or refresh unconditionally on every `message_update`.
+
+Resnapshot uses the existing event-bus barrier: queued pre-boundary notifications may be discarded, while post-boundary notifications wait for the new snapshot to install. An already-running listener is not revoked. A whole operation can start and finish before capture while its notifications remain queued: resnapshot then returns `operation: null` and may skip both notifications, losing that operation's result from this observation path. Session watch therefore cannot guarantee completion counts, failure alerts, or a complete execution log. Use operation results or a separate event-processing path when those are required.
+
+It is safe to `await handle.resnapshot(context)` inside a `start` listener. This does not extend to raw `events.on` listeners, which execute on the bus delivery chain and can wait on their own queued barrier. Resnapshot before start is supported; concurrent resnapshots on one handle reject, as does resnapshot after unsubscribe. Unsubscribing during capture never reactivates delivery. A failed refresh does not restore skipped notifications: treat `HarnessClosed`/`HarnessFault` as terminal; for other failures, end the handle and resolve the cause before subscribing again.
+
+Successful Session captures have `faulted: false`. A fault publishes one `fault` notification and closes publication; later watch/resnapshot calls reject with `HarnessFault`. A resnapshot racing fault may instead report that exception after invalidating the old queued fault notification. Consumers maintain their own terminal marker: an older `snapshot.faulted` never changes in the background. Normal close rejects new captures with `HarnessClosed` and publishes no synthetic terminal event. Events bound or buffered before close may still drain, including when an existing handle starts afterward; `close()` is not a watcher-callback completion barrier.
+
+Call `unsubscribe()` explicitly in `finally`; cancelling a Context does not unsubscribe. Unsubscribe is idempotent, clears startup buffering, and prevents new callbacks from starting, while an already-running callback finishes normally. Slow listeners and delayed starts can grow unbounded queues; the small snapshot does not bound the full event stream, and this interface adds no backpressure or buffer limit. Watchers have independent delivery queues. Listener errors do not roll back commits or fault the Harness; while publication remains open they report `handler_error`, whose listener errors do not recursively report themselves.
+
+Minimal in-process use, with application-owned `render`, `showStopped`, and observation-lifetime functions:
+
+```ts
+const watch = await harness.watchSession(context);
+try {
+  render(watch.snapshot);
+  watch.start(async (event, eventContext) => {
+    if (event.type === "fault") {
+      watch.unsubscribe();
+      showStopped(event);
+      return;
+    }
+    switch (event.type) {
+      case "lane_created":
+      case "run_start":
+      case "operation_abort":
+      case "run_end":
+      case "compaction_start":
+      case "compaction_end":
+      case "navigation_start":
+      case "navigation_end":
+        try {
+          render(await watch.resnapshot(eventContext));
+        } catch (error) {
+          watch.unsubscribe();
+          showStopped(error);
+        }
+    }
+  });
+  await observationLifetime();
+} finally {
+  watch.unsubscribe();
+}
+```
+
+This example refreshes operation lifecycle summaries; it does not observe every field transition. The runnable faux-provider example in `test/harness/runtime/session-watch-demo.test.ts` uses explicit workload gates and an event-driven consumer to show dynamic Lane creation, normal completion, and cancellation (`open → aborting → null`). It is an in-process demonstration, not a remote client. From `packages/agent`, run:
+
+```bash
+node ../../node_modules/vitest/dist/cli.js --run test/harness/runtime/session-watch-demo.test.ts
+```
+
 ## 5.5 Events
 
 Events are passive committed-state/lifecycle observations: they never drive execution and are not replayed from durable history. `HarnessEvent` adds `lane` to lane-scoped payloads and may add `recovery: true` for actual orphan recovery/replay. Full payload unions: `agent-harness.ts`. The authoritative groups:
@@ -1161,7 +1219,7 @@ Acceptance publishes after its transaction: the start event, message lifecycle p
 
 Clients depend on the terminal taxonomy: `run_end` closes a run; `navigation_end` closes navigation and requires snapshot rebase; standalone-compaction `compaction_end` closes compaction; in-run `compaction_start`/`compaction_end` are nested segment brackets that do not clear the run; `run_suspend` keeps the operation open. Every structural start has one matching end, including `aborted`. `compaction_end.status` is `completed | declined | failed | aborted` (success carries `entryId`); `run_end` is `completed | failed | aborted`; `navigation_end` additionally permits `declined`.
 
-The event bus binds recipients and Context synchronously after commit, serializes delivery in mutation order, and makes the public operation await its retained delivery promise. Listener failures emit `handler_error` and do not roll back committed state. `watch` recipients install on the mutation line so no event falls between snapshot and subscription. `reduceLaneSnapshot` (§5.4) is the supported fold; clients should not reconstruct operation terminality or queue/config/stat state with a second reducer.
+The event bus binds recipients and Context synchronously after commit, serializes delivery in mutation order, and makes the public operation await its retained delivery promise. Listener failures emit `handler_error` and do not roll back committed state. `watch` recipients install on the mutation line so no event falls between snapshot and subscription. `reduceLaneSnapshot` (§5.4) is the supported Lane fold; Lane clients should not reconstruct operation terminality or queue/config/stat state with a second reducer. Session watch has no fold and uses authoritative resnapshot instead. Watch listener callbacks have their own delivery tails: a public operation waiting for bus delivery does not wait for those callbacks to finish.
 
 ## 5.6 Hooks
 
@@ -1298,9 +1356,9 @@ Workflow: keep a future package's row here until actionable; move exact files/te
 | WP08 | in progress — Slice A | Replace implicit-main forks with named-branch/tree semantics and bounded-memory backend copies. | [Named-branch and tree forks with streaming copies](work-packages/08-named-branch-streaming-forks.md) |
 | WP09 | complete | Project effect-pending and settled-but-unplaced tool calls continuously through snapshots and lifecycle events until transcript placement. | [LaneSnapshot settled-but-unplaced tools](work-packages/09-lane-snapshot-settled-tools.md) |
 
-WP05 subsumed the former R2–R12 execution rows; their implemented contract is in Parts 0–5 and the completed handoff.
+WP05 subsumed the former execution rows; their implemented contract is in Parts 0–5 and the completed handoff. R12 Session-wide watch is now implemented separately as lightweight capture plus notifications (§5.4); remote replication remains separate work.
 
-Future candidates (detail and order in the roadmap): **WP08** — complete Slice A and the JSONL/SQLite streaming slices; **H1** — resolve the `OperationStatus.running`, abort signal/event-order, and private gate-close typing contracts and audit Part 9 coverage; **C1** — resolve the §2.8 raw-RemoteSession contradiction before implementing either direction; **L1** — repository ownership of open handles and all-settled close across the three backends; **J1** — implement the §1.7 snapshot rewrite, dead-byte triggers, preserved high-water/list sequences, physical reclamation; the **[mobile assistant-output handoff](mobile-handoff/01-harness/05-assistant-output/message-update.md)** — implement tracked assistant progress, scoped durability, and delta replication without weakening unknown-outcome recovery; **R12** — implement `watchSession`; **T1** — reconcile the declared telemetry schema, then implement retained local spans (RPC trace propagation and an exporter are separate follow-ups); **S3** — reconcile the draft search API, then implement the standalone service, repository catch-up utilities, and the reference SQLite FTS5 projection (§2.8); **R11** — chained migrate-on-open under exclusive host ownership with total mappings (Part 7), activated only before the first incompatible stabilized-format change.
+Future candidates (detail and order in the roadmap): **WP08** — complete Slice A and the JSONL/SQLite streaming slices; **H1** — resolve the `OperationStatus.running`, abort signal/event-order, and private gate-close typing contracts and audit Part 9 coverage; **C1** — resolve the §2.8 raw-RemoteSession contradiction before implementing either direction; **L1** — repository ownership of open handles and all-settled close across the three backends; **J1** — implement the §1.7 snapshot rewrite, dead-byte triggers, preserved high-water/list sequences, physical reclamation; the **[mobile assistant-output handoff](mobile-handoff/01-harness/05-assistant-output/message-update.md)** — implement tracked assistant progress, scoped durability, and delta replication without weakening unknown-outcome recovery; **T1** — reconcile the declared telemetry schema, then implement retained local spans (RPC trace propagation and an exporter are separate follow-ups); **S3** — reconcile the draft search API, then implement the standalone service, repository catch-up utilities, and the reference SQLite FTS5 projection (§2.8); **R11** — chained migrate-on-open under exclusive host ownership with total mappings (Part 7), activated only before the first incompatible stabilized-format change.
 
 Client watch/subscription incarnation fencing, SQLite branch/query performance, pending-payload measurement, and optional presentation/plugin capabilities are inventoried in the roadmap; they do not alter the Harness state machine. Protocol, client/server resnapshot, and lane reducer surfaces required by WP05 are already implemented; future protocol work extends them rather than redefining the lane contract.
 
