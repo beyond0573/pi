@@ -158,9 +158,13 @@ const dirtyNode = (): DirtyNode => ({ children: new Map() });
 
 const spliceItems = (target: unknown[], index: number, remove: number, items: JsonValue[]): JsonValue[] => {
 	const removed = Reflect.apply(Array.prototype.splice, target, [index, remove]) as JsonValue[];
-	const chunkSize = 10_000;
-	for (let offset = 0; offset < items.length; offset += chunkSize) {
-		Reflect.apply(Array.prototype.splice, target, [index + offset, 0, ...items.slice(offset, offset + chunkSize)]);
+	// The caller's arguments still occupy the stack, so even a chunked spread
+	// can overflow. Move the suffix once and insert without another argument list.
+	if (items.length > 0) {
+		for (let offset = target.length - 1; offset >= index; offset--) {
+			target[offset + items.length] = target[offset];
+		}
+		for (let offset = 0; offset < items.length; offset++) target[index + offset] = items[offset];
 	}
 	return removed;
 };

@@ -365,6 +365,28 @@ describe("tracker: root ops", () => {
 		expect(t.flush()).toEqual([["p", ["xs"], 0, 0, items]]);
 	});
 
+	it("accepts large unshift argument lists and preserves the existing suffix", () => {
+		const initial = { xs: [-1, -2] };
+		const t = track(structuredClone(initial));
+		t.flush();
+		const items = Array.from({ length: 100_000 }, (_, index) => index);
+		const expected = { xs: [...items, -1, -2] };
+		expect(Reflect.apply(t.state.xs.unshift, t.state.xs, items)).toBe(expected.xs.length);
+		expect(t.target).toEqual(expected);
+		expect(apply(initial, t.flush())).toEqual(expected);
+	});
+
+	it("accepts large splice argument lists and preserves removed values and retained ends", () => {
+		const initial = { xs: [-1, -2, -3, -4] };
+		const t = track(structuredClone(initial));
+		t.flush();
+		const items = Array.from({ length: 100_000 }, (_, index) => index);
+		const expected = { xs: [-1, ...items, -4] };
+		expect(Reflect.apply(t.state.xs.splice, t.state.xs, [1, 2, ...items])).toEqual([-2, -3]);
+		expect(t.target).toEqual(expected);
+		expect(apply(initial, t.flush())).toEqual(expected);
+	});
+
 	it("grows arrays with explicit null values", () => {
 		const initial = { xs: [1] as (number | null)[] };
 		const t = track(structuredClone(initial));
