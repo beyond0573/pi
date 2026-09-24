@@ -9,6 +9,8 @@ import type {
 	LaneInfo,
 	OpenOperation,
 	Resources,
+	SessionSnapshot,
+	WatchHandle,
 } from "../agent-harness.ts";
 import { type CompactionSettings, DEFAULT_COMPACTION_SETTINGS } from "../compaction/compaction.ts";
 import { DEFAULT_RETRY_POLICY, validateCompactionSettings, validateRetryPolicy, validateToolNames } from "../config.ts";
@@ -22,8 +24,9 @@ import type { LaneConfiguration, Session } from "../session/types.ts";
 import { branchTip, deleteValue, entryLabel, laneConfig, laneState, sessionName, setValue } from "../session/values.ts";
 import type { AgentHarnessStreamOptions, AgentHarnessTool } from "../types.ts";
 import { Lane } from "./lane.ts";
+import { currentOperationInfo } from "./operation-info.ts";
 import { readLaneStorage, restoreLaneState, restoreSession } from "./restore.ts";
-import { type Config, type LaneState, SliceNotImplemented } from "./types.ts";
+import type { Config, LaneState } from "./types.ts";
 
 /** Runtime implementation of AgentHarness. The harness manages lanes but is not itself a lane. */
 export class Harness<TContext extends object | undefined> implements AgentHarness<TContext> {
@@ -302,8 +305,51 @@ export class Harness<TContext extends object | undefined> implements AgentHarnes
 		);
 	}
 
-	async watchSession(_context: Context): Promise<never> {
-		throw new SliceNotImplemented("watchSession");
+	watchSession(context: Context): Promise<WatchHandle<SessionSnapshot>> {
+		// Capture and registration are synchronous on the Session line: no nested lane reads or subscription gap.
+		return this.readSession(
+			() =>
+				this.events.watch(
+					this.captureSessionSnapshot(),
+					() => true,
+					context,
+					(resnapshotContext, markBoundary) =>
+						this.readSession(() => {
+							const snapshot = this.captureSessionSnapshot();
+							markBoundary();
+							return snapshot;
+						}, resnapshotContext),
+				),
+			context,
+		);
+	}
+
+	private async readSession<T>(read: () => T, context: Context): Promise<T> {
+		this.assertOpen();
+		try {
+			return await this.session.mutate(() => {
+				this.assertOpen();
+				try {
+					return read();
+				} catch (error) {
+					throw this.fault(error, context);
+				}
+			}, context);
+		} catch (error) {
+			this.assertOpen();
+			throw error;
+		}
+	}
+
+	private captureSessionSnapshot(): SessionSnapshot {
+		const lanes = [...this.lanesByName.values()]
+			.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))
+			.map((lane) => ({
+				name: lane.name,
+				tipId: lane.state.tipId,
+				operation: currentOperationInfo(lane.state.operation),
+			}));
+		return { lanes, faulted: false };
 	}
 
 	fault(cause: unknown, context: Context): Error {

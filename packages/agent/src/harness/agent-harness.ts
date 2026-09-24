@@ -247,6 +247,11 @@ export interface LaneSnapshot {
 	faulted: boolean;
 }
 
+/**
+ * Lightweight capture of all managed AgentLanes, sorted by JavaScript string order.
+ * Ordinary events do not update this object; use the handle's resnapshot for current state.
+ * Successful captures have faulted: false; fault events or HarnessFault signal termination.
+ */
 export interface SessionSnapshot {
 	lanes: LaneInfo[];
 	faulted: boolean;
@@ -605,6 +610,17 @@ export interface AgentHarness<TContext extends object | undefined = object | und
 	setSteeringMode(mode: QueueMode, context: Context): Promise<void>;
 	getFollowUpMode(context: Context): Promise<QueueMode>;
 	setFollowUpMode(mode: QueueMode, context: Context): Promise<void>;
+	/**
+	 * Capture the lane inventory and register all Harness events at one Session boundary.
+	 * Read snapshot, then promptly start the listener; events buffer until start.
+	 * This is a notification interface, not an event-only replica or audit log:
+	 * resnapshot replaces snapshot and may skip queued pre-boundary notifications,
+	 * including an entire operation's start/end; not every snapshot field change emits an event.
+	 * Operation status "open" means unfinished, not necessarily actively executing.
+	 * Listener callbacks may await resnapshot and receive each event's source Context.
+	 * Close stops publication but lets bound/buffered events drain. Explicitly unsubscribe
+	 * in finally; Context cancellation does not unsubscribe, and slow consumers can queue events.
+	 */
 	watchSession(context: Context): Promise<WatchHandle<SessionSnapshot>>;
 	readonly hooks: Hooks;
 	readonly events: Events;
